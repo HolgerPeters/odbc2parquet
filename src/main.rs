@@ -1,5 +1,6 @@
 mod parquet_buffer;
 mod query;
+mod insert;
 
 use anyhow::{bail, Error};
 use odbc_api::{Connection, Environment};
@@ -27,6 +28,11 @@ enum Command {
     ListDrivers,
     /// List preconfigured data sources. Useful to find data source name to connect to database.
     ListDataSources,
+    /// Read the content of a parquet and insert it into a table.
+    Insert {
+        #[structopt(flatten)]
+        insert_opt: InsertOpt,
+    },
 }
 
 /// Command line arguments used to establish a connection with the ODBC data source
@@ -75,6 +81,19 @@ pub struct QueryOpt {
     parameters: Vec<String>,
 }
 
+#[derive(StructOpt)]
+pub struct InsertOpt {
+    #[structopt(flatten)]
+    connect_opts: ConnectOpts,
+    /// Path to the input csv file which is used to fill the database table with values. If
+    /// omitted stdin is used.
+    #[structopt(long, short = "o")]
+    input: Option<PathBuf>,
+    /// Name of the table to insert the values into. No precautions against SQL injection are
+    /// taken.
+    table: String,
+}
+
 fn main() -> Result<(), Error> {
     let opt = Cli::from_args();
 
@@ -94,6 +113,9 @@ fn main() -> Result<(), Error> {
     match opt.command {
         Command::Query { query_opt } => {
             query::query(&odbc_env, &query_opt)?;
+        }
+        Command::Insert { insert_opt } => {
+            insert::insert(&odbc_env, &insert_opt)?;
         }
         Command::ListDrivers => {
             for driver_info in odbc_env.drivers()? {
