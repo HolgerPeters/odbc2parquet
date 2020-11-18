@@ -85,10 +85,8 @@ pub struct QueryOpt {
 pub struct InsertOpt {
     #[structopt(flatten)]
     connect_opts: ConnectOpts,
-    /// Path to the input csv file which is used to fill the database table with values. If
-    /// omitted stdin is used.
-    #[structopt(long, short = "o")]
-    input: Option<PathBuf>,
+    /// Path to the input parquet file which is used to fill the database table with values.
+    input: PathBuf,
     /// Name of the table to insert the values into. No precautions against SQL injection are
     /// taken.
     table: String,
