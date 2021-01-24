@@ -103,6 +103,16 @@ fn cursor_to_parquet(
                 (ColumnWriter::DoubleColumnWriter(cw), AnyColumnView::NullableF64(it)) => {
                     pb.write_optional(cw, it)?;
                 }
+                // This combination of odbc and parquet buffer, currently only occurs for Logical
+                // Type time ms.
+                (ColumnWriter::Int32ColumnWriter(cw), AnyColumnView::Text(it)) => {
+                    pb.write_optional(cw, it)?;
+                }
+                // This combination of odbc and parquet buffer, currently only occurs for Logical
+                // Type time mu.
+                (ColumnWriter::Int64ColumnWriter(cw), AnyColumnView::Text(it)) => {
+                    pb.write_optional(cw, it)?;
+                }
                 (ColumnWriter::ByteArrayColumnWriter(cw), AnyColumnView::Text(it)) => {
                     pb.write_optional(cw, it)?;
                 }
@@ -150,96 +160,118 @@ fn make_schema(cursor: &impl Cursor) -> Result<(TypePtr, Vec<(u16, BufferDescrip
 
         let ptb = |physical_type| Type::primitive_type_builder(&name, physical_type);
 
-        let (field_builder, buffer_kind) = match cd.data_type {
-            DataType::Double => (ptb(PhysicalType::DOUBLE), BufferKind::F64),
-            DataType::Float | DataType::Real => (ptb(PhysicalType::FLOAT), BufferKind::F32),
-            DataType::SmallInt => (
-                ptb(PhysicalType::INT32).with_logical_type(LogicalType::INT_16),
-                BufferKind::I32,
-            ),
-            DataType::Integer => (
-                ptb(PhysicalType::INT32).with_logical_type(LogicalType::INT_32),
-                BufferKind::I32,
-            ),
-            DataType::Date => (
-                ptb(PhysicalType::INT32).with_logical_type(LogicalType::DATE),
-                BufferKind::Date,
-            ),
-            DataType::Decimal {
-                scale: 0,
-                precision: p @ 0..=9,
-            }
-            | DataType::Numeric {
-                scale: 0,
-                precision: p @ 0..=9,
-            } => (
-                ptb(PhysicalType::INT32)
-                    .with_logical_type(LogicalType::DECIMAL)
-                    .with_precision(p as i32)
-                    .with_scale(0),
-                BufferKind::I32,
-            ),
-            DataType::Decimal {
-                scale: 0,
-                precision: p @ 0..=18,
-            }
-            | DataType::Numeric {
-                scale: 0,
-                precision: p @ 0..=18,
-            } => (
-                ptb(PhysicalType::INT64)
-                    .with_logical_type(LogicalType::DECIMAL)
-                    .with_precision(p as i32)
-                    .with_scale(0),
-                BufferKind::I64,
-            ),
-            DataType::Numeric { scale, precision } | DataType::Decimal { scale, precision } => {
-                // Length of the two's complement.
-                let num_binary_digits = precision as f64 * 10f64.log2();
-                // Plus one bit for the sign (+/-)
-                let length_in_bits = num_binary_digits + 1.0;
-                let length_in_bytes = (length_in_bits / 8.0).ceil() as i32;
-                (
-                    ptb(PhysicalType::FIXED_LEN_BYTE_ARRAY)
-                        .with_length(dbg!(length_in_bytes))
+        let (field_builder, buffer_kind) =
+            match cd.data_type {
+                DataType::Double => (ptb(PhysicalType::DOUBLE), BufferKind::F64),
+                DataType::Float | DataType::Real => (ptb(PhysicalType::FLOAT), BufferKind::F32),
+                DataType::SmallInt => (
+                    ptb(PhysicalType::INT32).with_logical_type(LogicalType::INT_16),
+                    BufferKind::I32,
+                ),
+                DataType::Integer => (
+                    ptb(PhysicalType::INT32).with_logical_type(LogicalType::INT_32),
+                    BufferKind::I32,
+                ),
+                DataType::Date => (
+                    ptb(PhysicalType::INT32).with_logical_type(LogicalType::DATE),
+                    BufferKind::Date,
+                ),
+                DataType::Decimal {
+                    scale: 0,
+                    precision: p @ 0..=9,
+                }
+                | DataType::Numeric {
+                    scale: 0,
+                    precision: p @ 0..=9,
+                } => (
+                    ptb(PhysicalType::INT32)
                         .with_logical_type(LogicalType::DECIMAL)
-                        .with_precision(precision.try_into().unwrap())
-                        .with_scale(scale.try_into().unwrap()),
+                        .with_precision(p as i32)
+                        .with_scale(0),
+                    BufferKind::I32,
+                ),
+                DataType::Decimal {
+                    scale: 0,
+                    precision: p @ 0..=18,
+                }
+                | DataType::Numeric {
+                    scale: 0,
+                    precision: p @ 0..=18,
+                } => (
+                    ptb(PhysicalType::INT64)
+                        .with_logical_type(LogicalType::DECIMAL)
+                        .with_precision(p as i32)
+                        .with_scale(0),
+                    BufferKind::I64,
+                ),
+                DataType::Numeric { scale, precision } | DataType::Decimal { scale, precision } => {
+                    // Length of the two's complement.
+                    let num_binary_digits = precision as f64 * 10f64.log2();
+                    // Plus one bit for the sign (+/-)
+                    let length_in_bits = num_binary_digits + 1.0;
+                    let length_in_bytes = (length_in_bits / 8.0).ceil() as i32;
+                    (
+                        ptb(PhysicalType::FIXED_LEN_BYTE_ARRAY)
+                            .with_length(dbg!(length_in_bytes))
+                            .with_logical_type(LogicalType::DECIMAL)
+                            .with_precision(precision.try_into().unwrap())
+                            .with_scale(scale.try_into().unwrap()),
+                        BufferKind::Text {
+                            max_str_len: cd.data_type.column_size(),
+                        },
+                    )
+                }
+                // We are loosing information in case of nanoseconds precision.
+                DataType::Timestamp { .. } => (
+                    ptb(PhysicalType::INT64).with_logical_type(LogicalType::TIMESTAMP_MICROS),
+                    BufferKind::Timestamp,
+                ),
+                DataType::Bigint => (
+                    ptb(PhysicalType::INT64).with_logical_type(LogicalType::INT_64),
+                    BufferKind::I64,
+                ),
+                DataType::Bit => (ptb(PhysicalType::BOOLEAN), BufferKind::Bit),
+                DataType::Tinyint => (
+                    ptb(PhysicalType::INT32).with_logical_type(LogicalType::INT_8),
+                    BufferKind::I32,
+                ),
+                // Specific ODBC Time struct does only support fractions of zero. Parsing time from
+                // text works for any case.
+                DataType::Time {
+                    precision: 0..=3,
+                } => (
+                    ptb(PhysicalType::INT32).with_logical_type(LogicalType::TIME_MILLIS),
                     BufferKind::Text {
-                        max_str_len: cd.data_type.column_size(),
+                        max_str_len: cd.data_type.utf8_len().expect(
+                            "Time fields always have a well defined character representation.",
+                        ),
                     },
-                )
-            }
-            DataType::Timestamp { .. } => (
-                ptb(PhysicalType::INT64).with_logical_type(LogicalType::TIMESTAMP_MICROS),
-                BufferKind::Timestamp,
-            ),
-            DataType::Bigint => (
-                ptb(PhysicalType::INT64).with_logical_type(LogicalType::INT_64),
-                BufferKind::I64,
-            ),
-            DataType::Bit => (ptb(PhysicalType::BOOLEAN), BufferKind::Bit),
-            DataType::Tinyint => (
-                ptb(PhysicalType::INT32).with_logical_type(LogicalType::INT_8),
-                BufferKind::I32,
-            ),
-            DataType::Char { .. }
-            | DataType::Varchar { .. }
-            | DataType::WVarchar { .. }
-            | DataType::Unknown
-            | DataType::Time { .. }
-            | DataType::Other { .. } => {
-                let max_str_len = if let Some(len) = cd.data_type.utf8_len() {
-                    len
-                } else {
-                    cursor.col_display_size(index.try_into().unwrap())? as usize
-                };
-                (
-                    ptb(PhysicalType::BYTE_ARRAY).with_logical_type(LogicalType::UTF8),
-                    BufferKind::Text { max_str_len },
-                )
-            }
-        };
+                ),
+                // We are loosing information in case of nanoseconds precision.
+                DataType::Time { .. } => (
+                    ptb(PhysicalType::INT64).with_logical_type(LogicalType::TIME_MICROS),
+                    BufferKind::Text {
+                        max_str_len: cd.data_type.utf8_len().expect(
+                            "Time fields always have a well defined character representation.",
+                        ),
+                    },
+                ),
+                DataType::Char { .. }
+                | DataType::Varchar { .. }
+                | DataType::WVarchar { .. }
+                | DataType::Unknown
+                | DataType::Other { .. } => {
+                    let max_str_len = if let Some(len) = cd.data_type.utf8_len() {
+                        len
+                    } else {
+                        cursor.col_display_size(index.try_into().unwrap())? as usize
+                    };
+                    (
+                        ptb(PhysicalType::BYTE_ARRAY).with_logical_type(LogicalType::UTF8),
+                        BufferKind::Text { max_str_len },
+                    )
+                }
+            };
 
         let buffer_description = BufferDescription {
             kind: buffer_kind,

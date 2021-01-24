@@ -1,5 +1,6 @@
 use anyhow::Error;
-use chrono::NaiveDate;
+use atoi::FromRadix10;
+use chrono::{NaiveDate, NaiveTime};
 use num_bigint::BigInt;
 use odbc_api::{
     sys::{Date, Timestamp},
@@ -165,6 +166,36 @@ impl ParquetBuffer {
     }
 }
 
+// This function might go into odbc-api
+/// Parse timestamp from representation HH:MM:SS[.FFF]
+fn parse_time(input: &CStr) -> NaiveTime {
+    let bytes = input.to_bytes();
+    // From radix ten also returns the number of bytes extracted. We don't care. Should always
+    // be two, for hour, min and sec.
+    let (hour, _) = u32::from_radix_10(&bytes[0..2]);
+    let (min, _) = u32::from_radix_10(&bytes[3..5]);
+    let (sec, _) = u32::from_radix_10(&bytes[6..8]);
+    // If a fractional part is present, we parse it.
+    let nano = if bytes.len() > 9 {
+        let (fraction, precision) = u32::from_radix_10(&bytes[9..]);
+        match precision {
+            0..=8 => {
+                // Pad value with `0` to represent nanoseconds
+                fraction * 10_u32.pow(9 - precision as u32)
+            },
+            9 => fraction,
+            _ => {
+                // More than nanoseconds precision. Let's just remove the additional digits at the
+                // end.
+                fraction / 10_u32.pow(precision as u32 - 9)
+            }
+        }
+    } else {
+        0
+    };
+    NaiveTime::from_hms_nano(hour, min, sec, nano)
+}
+
 pub trait BufferedDataType: Sized {
     fn mut_buf(buffer: &mut ParquetBuffer) -> (&mut [Self], &mut [i16]);
 }
@@ -236,6 +267,27 @@ where
     }
 }
 
+/// Conversion to milliseconds since midninght for Time representation HH:MM:SS[.FFF]
+impl IntoPhysical<i32> for &CStr {
+    fn into_physical(self) -> i32 {
+        let time = parse_time(self);
+            time.signed_duration_since(NaiveTime::from_num_seconds_from_midnight(0, 0))
+                .num_milliseconds()
+                .try_into()
+                .unwrap()
+    }
+}
+
+/// Conversion to milliseconds since midninght for Time representation HH:MM:SS[.FFFFFF]
+impl IntoPhysical<i64> for &CStr {
+    fn into_physical(self) -> i64 {
+        let time = parse_time(self);
+        time.signed_duration_since(NaiveTime::from_num_seconds_from_midnight(0, 0))
+            .num_microseconds()
+            .expect("Number of microseconds since midnight must fit into i64")
+    }
+}
+
 impl IntoPhysical<i32> for &Date {
     fn into_physical(self) -> i32 {
         let unix_epoch = NaiveDate::from_ymd(1970, 1, 1);
@@ -268,5 +320,68 @@ impl IntoPhysical<bool> for &Bit {
 impl IntoPhysical<ByteArray> for &CStr {
     fn into_physical(self) -> ByteArray {
         self.to_bytes().to_owned().into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn time_without_fraction() {
+        // Hours
+        let input = CStr::from_bytes_with_nul(b"12:00:00\0").unwrap();
+        let milliseconds_since_midnight: i32 = input.into_physical();
+        assert_eq!(milliseconds_since_midnight, 12 * 3600 * 1000);
+
+        // Minutes
+        let input = CStr::from_bytes_with_nul(b"00:17:00\0").unwrap();
+        let milliseconds_since_midnight: i32 = input.into_physical();
+        assert_eq!(milliseconds_since_midnight, 17 * 60 * 1000);
+
+        // Complete timestamp without fraction
+        let input = CStr::from_bytes_with_nul(b"12:17:51\0").unwrap();
+        let milliseconds_since_midnight: i32 = input.into_physical();
+        assert_eq!(
+            milliseconds_since_midnight,
+            (12 * 3600 + 17 * 60 + 51) * 1000
+        )
+    }
+
+    #[test]
+    fn time_with_milliseconds() {
+    
+        // Complete timestamp without fraction
+        let input = CStr::from_bytes_with_nul(b"12:17:51.123\0").unwrap();
+        let milliseconds_since_midnight: i32 = input.into_physical();
+        assert_eq!(
+            milliseconds_since_midnight,
+            (12 * 3600 + 17 * 60 + 51) * 1000 + 123
+        )
+    }
+
+    #[test]
+    fn time_with_microseconds() {
+    
+        // Complete timestamp without fraction
+        let input = CStr::from_bytes_with_nul(b"12:17:51.123456\0").unwrap();
+        let microseconds_since_midnight: i64 = input.into_physical();
+        assert_eq!(
+            microseconds_since_midnight,
+            (12 * 3600 + 17 * 60 + 51) * 1_000_000 + 123_456
+        )
+    }
+
+    #[test]
+    fn time_with_nanoseconds() {
+    
+        // Complete timestamp without fraction
+        let input = CStr::from_bytes_with_nul(b"12:17:51.123456789\0").unwrap();
+        let microseconds_since_midnight: i64 = input.into_physical();
+        assert_eq!(
+            microseconds_since_midnight,
+            (12 * 3600 + 17 * 60 + 51) * 1_000_000 + 123_456
+        )
     }
 }
